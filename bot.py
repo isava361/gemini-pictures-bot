@@ -40,6 +40,7 @@ from storage import (
     VALID_RATIOS,
     VALID_RESOLUTIONS,
     VALID_MODELS,
+    VALID_OUTPUT_MODES,
     MODEL_FLASH_ID,
     MODEL_PRO_ID,
     model_display_name,
@@ -123,6 +124,9 @@ def _short_model(model_id: str) -> str:
     if model_id == MODEL_PRO_ID:
         return "3"
     return model_id or "unknown"
+
+def output_mode_label(output_mode: str) -> str:
+    return "file" if output_mode == "file" else "photo"
 
 
 def sanitize_resolution(res: str, is_admin_flag: bool) -> str:
@@ -314,6 +318,7 @@ def settings_main_markup(owner_uid: int, is_admin_flag: bool) -> InlineKeyboardM
             InlineKeyboardButton("📐 Ratio", callback_data=f"st|{owner_uid}|nav|u_ratio"),
             InlineKeyboardButton("🖼 Resolution", callback_data=f"st|{owner_uid}|nav|u_res"),
         ],
+        [InlineKeyboardButton("📤 Output", callback_data=f"st|{owner_uid}|nav|u_output")],
     ]
     if is_admin_flag:
         rows.append([InlineKeyboardButton("🌍 Global model", callback_data=f"st|{owner_uid}|nav|g_model")])
@@ -323,6 +328,7 @@ def settings_main_markup(owner_uid: int, is_admin_flag: bool) -> InlineKeyboardM
                 InlineKeyboardButton("🌍 Global res", callback_data=f"st|{owner_uid}|nav|g_res"),
             ]
         )
+        rows.append([InlineKeyboardButton("🌍 Global output", callback_data=f"st|{owner_uid}|nav|g_output")])
         rows.append(
             [
                 InlineKeyboardButton("📊 Usage (day)", callback_data=f"st|{owner_uid}|nav|usage_day"),
@@ -387,6 +393,19 @@ def model_menu_markup(owner_uid: int, current_model: str, scope: str) -> InlineK
     return InlineKeyboardMarkup(rows)
 
 
+def output_menu_markup(owner_uid: int, current_output: str, scope: str) -> InlineKeyboardMarkup:
+    choices = [
+        ("photo", "🖼 Picture"),
+        ("file", "📎 File"),
+    ]
+    rows: List[List[InlineKeyboardButton]] = []
+    for mode, label in choices:
+        title = f"✅ {label}" if mode == current_output else label
+        rows.append([InlineKeyboardButton(title, callback_data=f"st|{owner_uid}|set|{scope}|output|{mode}")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def render_settings_main_text(db: Storage, user_id: int, is_admin_flag: bool) -> str:
     s = await db.get_effective_settings(user_id)
     eff_res = sanitize_resolution(s.resolution, is_admin_flag)
@@ -396,6 +415,7 @@ async def render_settings_main_text(db: Storage, user_id: int, is_admin_flag: bo
         f"- model: {model_display_name(s.model_id)} ({s.model_id})",
         f"- ratio: {s.ratio}",
         f"- resolution: {eff_res}",
+        f"- output: {output_mode_label(s.output_mode)}",
     ]
 
     if (not is_admin_flag) and (eff_res != (s.resolution or "").upper()):
@@ -409,6 +429,7 @@ async def render_settings_main_text(db: Storage, user_id: int, is_admin_flag: bo
             f"- global model: {model_display_name(gs.model_id)} ({gs.model_id})",
             f"- global ratio: {gs.ratio}",
             f"- global resolution: {gs.resolution}",
+            f"- global output: {output_mode_label(gs.output_mode)}",
         ]
 
     # Лимиты для не-админов: показываем обе модели
@@ -440,12 +461,16 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
     st|<owner_uid>|nav|g_model
     st|<owner_uid>|nav|g_ratio
     st|<owner_uid>|nav|g_res
+    st|<owner_uid>|nav|u_output
+    st|<owner_uid>|nav|g_output
     st|<owner_uid>|set|u|model|<model_id>
     st|<owner_uid>|set|u|ratio|<ratio>
     st|<owner_uid>|set|u|res|<1K|2K|4K>
+    st|<owner_uid>|set|u|output|<photo|file>
     st|<owner_uid>|set|g|model|<model_id>
     st|<owner_uid>|set|g|ratio|<ratio>
     st|<owner_uid>|set|g|res|<1K|2K|4K>
+    st|<owner_uid>|set|g|output|<photo|file>
     """
     parts = data.split("|")
     if len(parts) < 4:
@@ -521,6 +546,17 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
             )
             await safe_answer_callback(query, "Ок.")
             return
+        if dest == "u_output":
+            s = await db.get_effective_settings(owner_uid)
+            await safe_edit_text(
+                context.bot,
+                chat_id,
+                message_id,
+                "Выберите формат отправки (персонально):",
+                reply_markup=output_menu_markup(owner_uid, s.output_mode, scope="u"),
+            )
+            await safe_answer_callback(query, "Ок.")
+            return
 
         if dest == "g_model":
             if not caller_is_admin:
@@ -563,6 +599,20 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
                 message_id,
                 "Выберите GLOBAL resolution:",
                 reply_markup=res_menu_markup(owner_uid, gs.resolution, scope="g", is_admin_flag=True),
+            )
+            await safe_answer_callback(query, "Ок.")
+            return
+        if dest == "g_output":
+            if not caller_is_admin:
+                await safe_answer_callback(query, "Только для администратора.")
+                return
+            gs = await db.get_global_settings()
+            await safe_edit_text(
+                context.bot,
+                chat_id,
+                message_id,
+                "Выберите GLOBAL формат отправки:",
+                reply_markup=output_menu_markup(owner_uid, gs.output_mode, scope="g"),
             )
             await safe_answer_callback(query, "Ок.")
             return
@@ -655,6 +705,16 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
                 await db.set_user_resolution(owner_uid, v)
             else:
                 await db.set_global_resolution(v)
+
+        elif field == "output":
+            v = value.strip().lower()
+            if v not in VALID_OUTPUT_MODES:
+                await safe_answer_callback(query, "Неверный формат.")
+                return
+            if scope == "u":
+                await db.set_user_output_mode(owner_uid, v)
+            else:
+                await db.set_global_output_mode(v)
 
         else:
             await safe_answer_callback(query, "Неизвестное поле.")
@@ -750,6 +810,7 @@ class Request:
     model_id: str
     ratio: str
     resolution: str
+    output_mode: str
 
 
 class UserWork:
@@ -830,7 +891,7 @@ async def enqueue_request(
 
     one_line = (
         f"⏳ В очереди: #{position} • {model_display_name(s.model_id)} • "
-        f"ratio {s.ratio} • res {eff_res}"
+        f"ratio {s.ratio} • res {eff_res} • output {output_mode_label(s.output_mode)}"
     )
     status_msg = await app.bot.send_message(
         chat_id=chat_id,
@@ -851,6 +912,7 @@ async def enqueue_request(
         model_id=s.model_id,
         ratio=s.ratio,
         resolution=eff_res,  # уже “клампнутый” res
+        output_mode=output_mode_label(s.output_mode),
     )
     state.req_index[req_id] = req
 
@@ -1027,12 +1089,12 @@ async def handle_request(
         )
         await app.bot.send_chat_action(chat_id=req.chat_id, action=ChatAction.UPLOAD_PHOTO)
 
-        await send_images(app, req.chat_id, images)
+        await send_images(app, req.chat_id, images, req.output_mode)
 
         dt = time.time() - t0
         done_line = (
             f"✅ Готово • {len(images)} шт • {dt:.1f}s • {model_display_name(req.model_id)} • "
-            f"ratio {chosen_ratio} • {effective_res}"
+            f"ratio {chosen_ratio} • {effective_res} • output {output_mode_label(req.output_mode)}"
         )
         await safe_edit_text(app.bot, req.chat_id, req.status_message_id, done_line, reply_markup=None)
 
@@ -1046,7 +1108,7 @@ async def handle_request(
         state.cancelled.discard(req.req_id)
 
 
-async def send_images(app: Application, chat_id: int, images_png: List[bytes]) -> None:
+async def send_images(app: Application, chat_id: int, images_png: List[bytes], output_mode: str) -> None:
     """
     Надёжная отправка результатов:
     - пытаемся отправлять пачками через send_media_group (до 10 фото, каждое <= ~9MB),
@@ -1063,9 +1125,11 @@ async def send_images(app: Application, chat_id: int, images_png: List[bytes]) -
         for i in range(0, len(seq), n):
             yield i, seq[i : i + n]
 
+    use_photo = output_mode != "file"
+
     for base_index, chunk in chunks(images_png, MAX_MEDIA_GROUP):
         # 1) Попытка media_group (только если в чанке >1 и все <= лимита)
-        if len(chunk) > 1 and all(len(b) <= MAX_PHOTO_BYTES for b in chunk):
+        if use_photo and len(chunk) > 1 and all(len(b) <= MAX_PHOTO_BYTES for b in chunk):
             media: List[InputMediaPhoto] = []
             for j, b in enumerate(chunk):
                 idx = base_index + j + 1
@@ -1090,7 +1154,7 @@ async def send_images(app: Application, chat_id: int, images_png: List[bytes]) -
             bio.seek(0)
             file = InputFile(bio, filename=f"image_{idx}.png")
 
-            if len(b) <= MAX_PHOTO_BYTES:
+            if use_photo and len(b) <= MAX_PHOTO_BYTES:
                 await app.bot.send_photo(chat_id=chat_id, photo=file)
             else:
                 await app.bot.send_document(chat_id=chat_id, document=file)
@@ -1177,7 +1241,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Редактирование: отправь фото/альбом, потом текст (или caption у фото).\n"
         "Можно: ответить (reply) текстом на фото/альбом — я возьму их как input.\n\n"
         "Настройки:\n"
-        "• /settings — модель (Nano Banana / Nano Banana Pro), ratio, resolution\n\n"
+        "• /settings — модель (Nano Banana / Nano Banana Pro), ratio, resolution, output\n\n"
         f"Твой user_id: {uid}\n\n"
         "Команды:\n"
         "/settings — текущие настройки\n"
