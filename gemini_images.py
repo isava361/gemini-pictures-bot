@@ -6,6 +6,7 @@ import base64
 import logging
 import random
 from dataclasses import dataclass
+from enum import Enum
 from io import BytesIO
 from typing import Any, Iterable, List, Optional, Tuple
 
@@ -26,6 +27,46 @@ class Usage:
     text_output_tokens: int = 0
     thinking_tokens: int = 0
     total_tokens: int = 0
+
+
+class ResponseMode(str, Enum):
+    FILE = "file"
+    PHOTO = "photo"
+
+
+@dataclass
+class UserSettings:
+    response_mode: ResponseMode = ResponseMode.PHOTO
+
+
+def update_settings_from_command(command: str, settings: UserSettings) -> Tuple[UserSettings, str]:
+    """
+    Update settings from a /settings command.
+    Supported option: response_mode=<file|photo>
+    """
+    parts = command.strip().split(maxsplit=1)
+    if len(parts) == 1:
+        return settings, (
+            "Settings:\n"
+            "- response_mode=<file|photo> (send images as a file or as a photo)\n"
+            f"Current response_mode={settings.response_mode.value}"
+        )
+
+    args = parts[1]
+    key, _, value = args.partition("=")
+    key = key.strip().lower()
+    value = value.strip().lower()
+
+    if key != "response_mode":
+        return settings, "Unknown settings option. Use response_mode=<file|photo>."
+
+    try:
+        new_mode = ResponseMode(value)
+    except ValueError:
+        return settings, "Invalid response_mode. Use response_mode=<file|photo>."
+
+    settings.response_mode = new_mode
+    return settings, f"Updated response_mode={settings.response_mode.value}."
 
 
 class GeminiImageService:
