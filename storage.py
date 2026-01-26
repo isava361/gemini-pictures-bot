@@ -7,6 +7,7 @@ from typing import Iterable, List, Dict, Any, Optional
 
 VALID_RATIOS = {"auto", "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
 VALID_RESOLUTIONS = {"1K", "2K", "4K"}
+VALID_OUTPUT_MODES = {"photo", "file"}
 
 # модели
 MODEL_FLASH_ID = "gemini-2.5-flash-image"       # Nano Banana
@@ -27,6 +28,7 @@ class GlobalSettings:
     ratio: str = "1:1"
     resolution: str = "1K"
     model_id: str = MODEL_PRO_ID
+    output_mode: str = "photo"
 
 
 class Storage:
@@ -124,6 +126,16 @@ class Storage:
             # 2) model_id в user_settings
             if not await self._has_column(db, "user_settings", "model_id"):
                 await db.execute("ALTER TABLE user_settings ADD COLUMN model_id TEXT")
+            # 2.1) output_mode в global_settings
+            if not await self._has_column(db, "global_settings", "output_mode"):
+                await db.execute("ALTER TABLE global_settings ADD COLUMN output_mode TEXT")
+                await db.execute(
+                    "UPDATE global_settings SET output_mode=? WHERE (output_mode IS NULL OR output_mode='')",
+                    ("photo",),
+                )
+            # 2.2) output_mode в user_settings
+            if not await self._has_column(db, "user_settings", "output_mode"):
+                await db.execute("ALTER TABLE user_settings ADD COLUMN output_mode TEXT")
 
             # 3) старая таблица usage_daily (оставляем для совместимости)
             await db.execute(
@@ -165,6 +177,10 @@ class Storage:
             await db.execute(
                 "UPDATE global_settings SET model_id=? WHERE id=1 AND (model_id IS NULL OR model_id='')",
                 (MODEL_PRO_ID,),
+            )
+            await db.execute(
+                "UPDATE global_settings SET output_mode=? WHERE id=1 AND (output_mode IS NULL OR output_mode='')",
+                ("photo",),
             )
 
             # ---- Token usage + profiles (для /usage) ----
@@ -244,10 +260,10 @@ class Storage:
 
     async def get_global_settings(self) -> GlobalSettings:
         async with self._db() as db:
-            cur = await db.execute("SELECT ratio, resolution, model_id FROM global_settings WHERE id=1")
+            cur = await db.execute("SELECT ratio, resolution, model_id, output_mode FROM global_settings WHERE id=1")
             row = await cur.fetchone()
             await cur.close()
-            return GlobalSettings(ratio=row[0], resolution=row[1], model_id=row[2])
+            return GlobalSettings(ratio=row[0], resolution=row[1], model_id=row[2], output_mode=row[3])
 
     async def set_global_ratio(self, ratio: str) -> None:
         if ratio not in VALID_RATIOS:
@@ -271,10 +287,20 @@ class Storage:
             await db.execute("UPDATE global_settings SET model_id=? WHERE id=1", (model_id,))
             await db.commit()
 
+    async def set_global_output_mode(self, output_mode: str) -> None:
+        if output_mode not in VALID_OUTPUT_MODES:
+            raise ValueError("Invalid output mode")
+        async with self._db() as db:
+            await db.execute("UPDATE global_settings SET output_mode=? WHERE id=1", (output_mode,))
+            await db.commit()
+
     async def get_effective_settings(self, user_id: int) -> GlobalSettings:
         g = await self.get_global_settings()
         async with self._db() as db:
-            cur = await db.execute("SELECT ratio, resolution, model_id FROM user_settings WHERE user_id=?", (int(user_id),))
+            cur = await db.execute(
+                "SELECT ratio, resolution, model_id, output_mode FROM user_settings WHERE user_id=?",
+                (int(user_id),),
+            )
             row = await cur.fetchone()
             await cur.close()
             if not row:
@@ -282,7 +308,8 @@ class Storage:
             ratio = row[0] if row[0] else g.ratio
             resolution = row[1] if row[1] else g.resolution
             model_id = row[2] if (len(row) > 2 and row[2]) else g.model_id
-            return GlobalSettings(ratio=ratio, resolution=resolution, model_id=model_id)
+            output_mode = row[3] if (len(row) > 3 and row[3]) else g.output_mode
+            return GlobalSettings(ratio=ratio, resolution=resolution, model_id=model_id, output_mode=output_mode)
 
     async def set_user_ratio(self, user_id: int, ratio: str) -> None:
         if ratio not in VALID_RATIOS:
@@ -290,8 +317,8 @@ class Storage:
         async with self._db() as db:
             await db.execute(
                 """
-                INSERT INTO user_settings(user_id, ratio, resolution, model_id)
-                VALUES (?, ?, NULL, NULL)
+                INSERT INTO user_settings(user_id, ratio, resolution, model_id, output_mode)
+                VALUES (?, ?, NULL, NULL, NULL)
                 ON CONFLICT(user_id) DO UPDATE SET ratio=excluded.ratio
                 """,
                 (int(user_id), ratio),
@@ -305,8 +332,8 @@ class Storage:
         async with self._db() as db:
             await db.execute(
                 """
-                INSERT INTO user_settings(user_id, ratio, resolution, model_id)
-                VALUES (?, NULL, ?, NULL)
+                INSERT INTO user_settings(user_id, ratio, resolution, model_id, output_mode)
+                VALUES (?, NULL, ?, NULL, NULL)
                 ON CONFLICT(user_id) DO UPDATE SET resolution=excluded.resolution
                 """,
                 (int(user_id), resolution),
@@ -319,11 +346,25 @@ class Storage:
         async with self._db() as db:
             await db.execute(
                 """
-                INSERT INTO user_settings(user_id, ratio, resolution, model_id)
-                VALUES (?, NULL, NULL, ?)
+                INSERT INTO user_settings(user_id, ratio, resolution, model_id, output_mode)
+                VALUES (?, NULL, NULL, ?, NULL)
                 ON CONFLICT(user_id) DO UPDATE SET model_id=excluded.model_id
                 """,
                 (int(user_id), model_id),
+            )
+            await db.commit()
+
+    async def set_user_output_mode(self, user_id: int, output_mode: str) -> None:
+        if output_mode not in VALID_OUTPUT_MODES:
+            raise ValueError("Invalid output mode")
+        async with self._db() as db:
+            await db.execute(
+                """
+                INSERT INTO user_settings(user_id, ratio, resolution, model_id, output_mode)
+                VALUES (?, NULL, NULL, NULL, ?)
+                ON CONFLICT(user_id) DO UPDATE SET output_mode=excluded.output_mode
+                """,
+                (int(user_id), output_mode),
             )
             await db.commit()
 
