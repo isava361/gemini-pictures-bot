@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import random
@@ -12,6 +13,8 @@ from io import BytesIO
 from typing import Deque, Dict, List, Optional, Tuple, Set
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
@@ -51,6 +54,7 @@ from gemini_images import GeminiImageService
 ALBUM_FLUSH_DELAY_SEC = 1.5
 CACHE_TTL_SEC = 10 * 60  # 10 минут
 CLEANUP_INTERVAL_SEC = 10 * 60  # уборка кешей раз в 10 минут
+MAX_PROMPT_LENGTH = 4000
 
 # ЛИМИТЫ (для НЕ-админов)
 FLASH_DAILY_LIMIT_NONADMIN = 40   # Gemini 2.5 (MODEL_FLASH_ID / Nano Banana)
@@ -211,7 +215,7 @@ async def touch_user_profile(db: Storage, user) -> None:
             last_name=getattr(user, "last_name", "") or "",
         )
     except Exception:
-        pass
+        logger.warning("Failed to upsert user profile for %s", user.id, exc_info=True)
 
 
 async def ensure_allowed(
@@ -293,14 +297,14 @@ async def safe_edit_text(
     except (BadRequest, Forbidden):
         pass
     except Exception:
-        pass
+        logger.debug("Failed to edit message %s in chat %s", message_id, chat_id, exc_info=True)
 
 
 async def safe_answer_callback(query, text: str) -> None:
     try:
         await query.answer(text, show_alert=False)
     except Exception:
-        pass
+        logger.debug("Failed to answer callback query", exc_info=True)
 
 
 # -----------------------------
@@ -311,7 +315,7 @@ def _chunks(lst, n: int):
         yield lst[i : i + n]
 
 
-def settings_main_markup(owner_uid: int, is_admin_flag: bool) -> InlineKeyboardMarkup:
+def settings_main_markup(owner_uid: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("🤖 Model", callback_data=f"st|{owner_uid}|nav|u_model")],
         [
@@ -320,21 +324,22 @@ def settings_main_markup(owner_uid: int, is_admin_flag: bool) -> InlineKeyboardM
         ],
         [InlineKeyboardButton("📤 Output", callback_data=f"st|{owner_uid}|nav|u_output")],
     ]
-    if is_admin_flag:
-        rows.append([InlineKeyboardButton("🌍 Global model", callback_data=f"st|{owner_uid}|nav|g_model")])
-        rows.append(
-            [
-                InlineKeyboardButton("🌍 Global ratio", callback_data=f"st|{owner_uid}|nav|g_ratio"),
-                InlineKeyboardButton("🌍 Global res", callback_data=f"st|{owner_uid}|nav|g_res"),
-            ]
-        )
-        rows.append([InlineKeyboardButton("🌍 Global output", callback_data=f"st|{owner_uid}|nav|g_output")])
-        rows.append(
-            [
-                InlineKeyboardButton("📊 Usage (day)", callback_data=f"st|{owner_uid}|nav|usage_day"),
-                InlineKeyboardButton("📅 Usage (month)", callback_data=f"st|{owner_uid}|nav|usage_month"),
-            ]
-        )
+    return InlineKeyboardMarkup(rows)
+
+
+def settings_global_markup(owner_uid: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🌍 Model", callback_data=f"st|{owner_uid}|nav|g_model")],
+        [
+            InlineKeyboardButton("🌍 Ratio", callback_data=f"st|{owner_uid}|nav|g_ratio"),
+            InlineKeyboardButton("🌍 Resolution", callback_data=f"st|{owner_uid}|nav|g_res"),
+        ],
+        [InlineKeyboardButton("🌍 Output", callback_data=f"st|{owner_uid}|nav|g_output")],
+        [
+            InlineKeyboardButton("📊 Usage (day)", callback_data=f"st|{owner_uid}|nav|usage_day"),
+            InlineKeyboardButton("📅 Usage (month)", callback_data=f"st|{owner_uid}|nav|usage_month"),
+        ],
+    ]
     return InlineKeyboardMarkup(rows)
 
 def admin_usage_markup(owner_uid: int) -> InlineKeyboardMarkup:
@@ -344,9 +349,13 @@ def admin_usage_markup(owner_uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 Usage (day)", callback_data=f"st|{owner_uid}|nav|usage_day"),
                 InlineKeyboardButton("📅 Usage (month)", callback_data=f"st|{owner_uid}|nav|usage_month"),
             ],
-            [InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")],
+            [InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main_global")],
         ]
     )
+
+
+def _back_dest(scope: str) -> str:
+    return "main_global" if scope == "g" else "main"
 
 
 def ratio_menu_markup(owner_uid: int, current_ratio: str, scope: str) -> InlineKeyboardMarkup:
@@ -358,12 +367,11 @@ def ratio_menu_markup(owner_uid: int, current_ratio: str, scope: str) -> InlineK
         buttons.append(InlineKeyboardButton(label, callback_data=f"st|{owner_uid}|set|{scope}|ratio|{r}"))
 
     rows = [list(row) for row in _chunks(buttons, 3)]
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|{_back_dest(scope)}")])
     return InlineKeyboardMarkup(rows)
 
 
 def res_menu_markup(owner_uid: int, current_res: str, scope: str, is_admin_flag: bool) -> InlineKeyboardMarkup:
-    # Для не-админов: скрываем 2K/4K
     current_res = sanitize_resolution(current_res, is_admin_flag)
 
     res_list = sorted(list(VALID_RESOLUTIONS))
@@ -375,8 +383,8 @@ def res_menu_markup(owner_uid: int, current_res: str, scope: str, is_admin_flag:
         label = f"✅ {r}" if r == current_res else r
         buttons.append(InlineKeyboardButton(label, callback_data=f"st|{owner_uid}|set|{scope}|res|{r}"))
 
-    rows = [buttons]  # 1 строка
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")])
+    rows = [buttons]
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|{_back_dest(scope)}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -389,7 +397,7 @@ def model_menu_markup(owner_uid: int, current_model: str, scope: str) -> InlineK
     for mid, name in choices:
         label = f"✅ {name}" if mid == current_model else name
         rows.append([InlineKeyboardButton(label, callback_data=f"st|{owner_uid}|set|{scope}|model|{mid}")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|{_back_dest(scope)}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -402,7 +410,7 @@ def output_menu_markup(owner_uid: int, current_output: str, scope: str) -> Inlin
     for mode, label in choices:
         title = f"✅ {label}" if mode == current_output else label
         rows.append([InlineKeyboardButton(title, callback_data=f"st|{owner_uid}|set|{scope}|output|{mode}")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|main")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data=f"st|{owner_uid}|nav|{_back_dest(scope)}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -421,18 +429,6 @@ async def render_settings_main_text(db: Storage, user_id: int, is_admin_flag: bo
     if (not is_admin_flag) and (eff_res != (s.resolution or "").upper()):
         lines.append("🔒 2K/4K доступны только администраторам (вам выставлено 1K).")
 
-    if is_admin_flag:
-        gs = await db.get_global_settings()
-        lines += [
-            "",
-            "Глобальные настройки (по умолчанию для всех):",
-            f"- global model: {model_display_name(gs.model_id)} ({gs.model_id})",
-            f"- global ratio: {gs.ratio}",
-            f"- global resolution: {gs.resolution}",
-            f"- global output: {output_mode_label(gs.output_mode)}",
-        ]
-
-    # Лимиты для не-админов: показываем обе модели
     if not is_admin_flag:
         day = moscow_day_key()
         used_flash = await db.get_model_count(user_id, day, MODEL_FLASH_ID)
@@ -449,6 +445,18 @@ async def render_settings_main_text(db: Storage, user_id: int, is_admin_flag: bo
             f"• день {day} • Europe/Moscow",
         ]
 
+    return "\n".join(lines)
+
+
+async def render_settings_global_text(db: Storage) -> str:
+    gs = await db.get_global_settings()
+    lines = [
+        "Глобальные настройки (по умолчанию для всех):",
+        f"- model: {model_display_name(gs.model_id)} ({gs.model_id})",
+        f"- ratio: {gs.ratio}",
+        f"- resolution: {gs.resolution}",
+        f"- output: {output_mode_label(gs.output_mode)}",
+    ]
     return "\n".join(lines)
 
 
@@ -507,7 +515,16 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
 
         if dest == "main":
             text = await render_settings_main_text(db, owner_uid, owner_is_admin)
-            await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_main_markup(owner_uid, owner_is_admin))
+            await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_main_markup(owner_uid))
+            await safe_answer_callback(query, "Ок.")
+            return
+
+        if dest == "main_global":
+            if not caller_is_admin:
+                await safe_answer_callback(query, "Только для администратора.")
+                return
+            text = await render_settings_global_text(db)
+            await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_global_markup(owner_uid))
             await safe_answer_callback(query, "Ок.")
             return
 
@@ -720,8 +737,12 @@ async def handle_settings_callback(query, context: ContextTypes.DEFAULT_TYPE, da
             await safe_answer_callback(query, "Неизвестное поле.")
             return
 
-        text = await render_settings_main_text(db, owner_uid, owner_is_admin)
-        await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_main_markup(owner_uid, owner_is_admin))
+        if scope == "g":
+            text = await render_settings_global_text(db)
+            await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_global_markup(owner_uid))
+        else:
+            text = await render_settings_main_text(db, owner_uid, owner_is_admin)
+            await safe_edit_text(context.bot, chat_id, message_id, text, reply_markup=settings_main_markup(owner_uid))
         await safe_answer_callback(query, "✅ Сохранено")
         return
 
@@ -863,60 +884,57 @@ async def enqueue_request(
 
     uw = get_user_work(state, user_id)
 
-    # лимит на выбранную модель для не-админов:
-    # учитываем уже использованное + то, что уже в очереди/выполняется ЭТОЙ ЖЕ моделью
+    # Лимит + постановка в очередь — всё под одним lock, чтобы не было TOCTOU race.
     async with uw.lock:
         position = len(uw.queue) + (1 if uw.current_req else 0) + 1
-        queued_same_model = 0
+
         if not admin_flag:
             queued_same_model = sum(1 for r in uw.queue if r.model_id == s.model_id)
             if uw.current_req and uw.current_req.model_id == s.model_id:
                 queued_same_model += 1
 
-    if not admin_flag:
-        limit = daily_limit_for_model(s.model_id)
-        if limit is not None:
-            used = await db.get_model_count(user_id, moscow_day_key(), s.model_id)
-            if used + queued_same_model >= limit:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    reply_to_message_id=reply_to_message_id,
-                    text=(
-                        f"🚫 Лимит {model_display_name(s.model_id)}: {limit} запросов в день.\n"
-                        f"Сегодня уже использовано: {used}/{limit}.\n"
-                        f"Переключись на другую модель в /settings → Model."
-                    ),
-                )
-                return
+            limit = daily_limit_for_model(s.model_id)
+            if limit is not None:
+                used = await db.get_model_count(user_id, moscow_day_key(), s.model_id)
+                if used + queued_same_model >= limit:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        reply_to_message_id=reply_to_message_id,
+                        text=(
+                            f"🚫 Лимит {model_display_name(s.model_id)}: {limit} запросов в день.\n"
+                            f"Сегодня уже использовано: {used}/{limit}.\n"
+                            f"Переключись на другую модель в /settings → Model."
+                        ),
+                    )
+                    return
 
-    one_line = (
-        f"⏳ В очереди: #{position} • {model_display_name(s.model_id)} • "
-        f"ratio {s.ratio} • res {eff_res} • output {output_mode_label(s.output_mode)}"
-    )
-    status_msg = await app.bot.send_message(
-        chat_id=chat_id,
-        text=one_line,
-        reply_to_message_id=reply_to_message_id,
-        reply_markup=cancel_markup(req_id),
-    )
+        one_line = (
+            f"⏳ В очереди: #{position} • {model_display_name(s.model_id)} • "
+            f"ratio {s.ratio} • res {eff_res} • output {output_mode_label(s.output_mode)}"
+        )
+        status_msg = await app.bot.send_message(
+            chat_id=chat_id,
+            text=one_line,
+            reply_to_message_id=reply_to_message_id,
+            reply_markup=cancel_markup(req_id),
+        )
 
-    req = Request(
-        req_id=req_id,
-        chat_id=chat_id,
-        user_id=user_id,
-        prompt=prompt,
-        file_ids=file_ids,
-        status_message_id=status_msg.message_id,
-        reply_to_message_id=reply_to_message_id,
-        created_at=time.time(),
-        model_id=s.model_id,
-        ratio=s.ratio,
-        resolution=eff_res,  # уже “клампнутый” res
-        output_mode=output_mode_label(s.output_mode),
-    )
-    state.req_index[req_id] = req
+        req = Request(
+            req_id=req_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            prompt=prompt,
+            file_ids=file_ids,
+            status_message_id=status_msg.message_id,
+            reply_to_message_id=reply_to_message_id,
+            created_at=time.time(),
+            model_id=s.model_id,
+            ratio=s.ratio,
+            resolution=eff_res,
+            output_mode=output_mode_label(s.output_mode),
+        )
+        state.req_index[req_id] = req
 
-    async with uw.lock:
         uw.queue.append(req)
         if uw.worker_task is None or uw.worker_task.done():
             uw.worker_task = app.create_task(user_worker(app, state, db, admin_ids, user_id))
@@ -1010,9 +1028,6 @@ async def handle_request(
                 state.cancelled.discard(req.req_id)
                 return
 
-            # резервируем попытку
-            await db.inc_model_count(req.user_id, day, req.model_id, 1)
-
     svcs: Dict[str, GeminiImageService] = app.bot_data["svcs"]
     svc: GeminiImageService = svcs[req.model_id]
 
@@ -1063,6 +1078,13 @@ async def handle_request(
             input_images=input_images,
         )
 
+        # Инкрементируем счётчик лимита только после успешного ответа API
+        if not is_admin(req.user_id, admin_ids):
+            try:
+                await db.inc_model_count(req.user_id, moscow_day_key(), req.model_id, 1)
+            except Exception:
+                logger.warning("Failed to increment model count for user %s", req.user_id, exc_info=True)
+
         # логируем токены (не валим запрос, если лог не удался)
         try:
             await db.log_token_usage(
@@ -1078,7 +1100,7 @@ async def handle_request(
                 total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
             )
         except Exception:
-            pass
+            logger.warning("Failed to log token usage for user %s", req.user_id, exc_info=True)
 
         await safe_edit_text(
             app.bot,
@@ -1244,7 +1266,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "• /settings — модель (Nano Banana / Nano Banana Pro), ratio, resolution, output\n\n"
         f"Твой user_id: {uid}\n\n"
         "Команды:\n"
-        "/settings — текущие настройки\n"
+        "/settings — персональные настройки\n"
+        "/settings_global — глобальные настройки (только для администраторов)\n"
         "/whoami — показать user_id\n\n"
     )
 
@@ -1268,7 +1291,20 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     admin_flag = is_admin(uid, admin_ids)
 
     text = await render_settings_main_text(db, uid, admin_flag)
-    await reply(update, context, text, reply_markup=settings_main_markup(uid, admin_flag))
+    await reply(update, context, text, reply_markup=settings_main_markup(uid))
+
+
+async def cmd_settings_global(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Storage = context.application.bot_data["db"]
+    admin_ids: List[int] = context.application.bot_data["admin_ids"]
+
+    if not is_admin(update.effective_user.id, admin_ids):
+        await reply(update, context, "Только для администратора.")
+        return
+
+    uid = update.effective_user.id
+    text = await render_settings_global_text(db)
+    await reply(update, context, text, reply_markup=settings_global_markup(uid))
 
 
 # --- Admin commands ---
@@ -1550,6 +1586,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not prompt:
         return
 
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        await reply(update, context, f"Слишком длинный промпт ({len(prompt)} символов). Максимум: {MAX_PROMPT_LENGTH}.")
+        return
+
     file_ids: Optional[List[str]] = None
 
     # 1) reply текстом на фото/альбом — берём input из reply
@@ -1736,6 +1776,13 @@ async def cleanup_state_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # -----------------------------
+# Error handler
+# -----------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Unhandled exception in handler", exc_info=context.error)
+
+
+# -----------------------------
 # Lifecycle
 # -----------------------------
 async def on_shutdown(app: Application) -> None:
@@ -1744,18 +1791,19 @@ async def on_shutdown(app: Application) -> None:
         try:
             await svc.aclose()
         except Exception:
-            pass
+            logger.warning("Error closing Gemini service", exc_info=True)
 
     db: Storage = app.bot_data.get("db")
     if db:
         try:
             await db.aclose()
         except Exception:
-            pass
+            logger.warning("Error closing database", exc_info=True)
 
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     load_dotenv()
 
     token = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -1776,16 +1824,6 @@ def main() -> None:
         db = Storage(db_path)
         await db.init()
         await db.seed_admins_as_allowed(admin_ids)
-
-        try:
-            if default_ratio in VALID_RATIOS:
-                await db.set_global_ratio(default_ratio)
-            if default_res in VALID_RESOLUTIONS:
-                await db.set_global_resolution(default_res)
-            if default_model in VALID_MODELS:
-                await db.set_global_model(default_model)
-        except Exception:
-            pass
 
         # 2 сервиса под 2 модели
         svcs = {
@@ -1817,6 +1855,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("settings_global", cmd_settings_global))
 
     # Admin
     app.add_handler(CommandHandler("allow", cmd_allow))
@@ -1833,6 +1872,9 @@ def main() -> None:
 
     # Text (non-commands)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    # Global error handler
+    app.add_error_handler(on_error)
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

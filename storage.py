@@ -295,21 +295,27 @@ class Storage:
             await db.commit()
 
     async def get_effective_settings(self, user_id: int) -> GlobalSettings:
-        g = await self.get_global_settings()
         async with self._db() as db:
             cur = await db.execute(
-                "SELECT ratio, resolution, model_id, output_mode FROM user_settings WHERE user_id=?",
+                """
+                SELECT g.ratio, g.resolution, g.model_id, g.output_mode,
+                       u.ratio, u.resolution, u.model_id, u.output_mode
+                FROM global_settings g
+                LEFT JOIN user_settings u ON u.user_id = ?
+                WHERE g.id = 1
+                """,
                 (int(user_id),),
             )
             row = await cur.fetchone()
             await cur.close()
             if not row:
-                return g
-            ratio = row[0] if row[0] else g.ratio
-            resolution = row[1] if row[1] else g.resolution
-            model_id = row[2] if (len(row) > 2 and row[2]) else g.model_id
-            output_mode = row[3] if (len(row) > 3 and row[3]) else g.output_mode
-            return GlobalSettings(ratio=ratio, resolution=resolution, model_id=model_id, output_mode=output_mode)
+                return GlobalSettings()
+            return GlobalSettings(
+                ratio=row[4] or row[0],
+                resolution=row[5] or row[1],
+                model_id=row[6] or row[2],
+                output_mode=row[7] or row[3],
+            )
 
     async def set_user_ratio(self, user_id: int, ratio: str) -> None:
         if ratio not in VALID_RATIOS:
